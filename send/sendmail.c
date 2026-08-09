@@ -83,11 +83,13 @@ static void alarm_handler(int sig)
  *                      child process. If it is NULL, stderr and stdout
  *                      are not redirected.
  * @param[in]  wait_time How long to wait for sendmail, `$sendmail_wait`
+ * @param[in]  async    Run sendmail in the background
+ * @param[out] pid_out  Process id of the delivery child, async only
  * @retval  0 Success
  * @retval >0 Failure, return code from sendmail
  */
 static int send_msg(const char *path, struct StringArray *args, const char *msg,
-                    char **tempfile, int wait_time)
+                    char **tempfile, int wait_time, bool async, pid_t *pid_out)
 {
   sigset_t set = { 0 };
   int st = 0;
@@ -244,6 +246,15 @@ static int send_msg(const char *path, struct StringArray *args, const char *msg,
 
   sigprocmask(SIG_UNBLOCK, &set, NULL);
 
+  if (async && (pid > 0))
+  {
+    // The delivery child keeps running; hand over its pid instead of waiting
+    if (pid_out)
+      *pid_out = pid;
+    mutt_sig_unblock_system(true);
+    return 0;
+  }
+
   if ((pid != -1) && (waitpid(pid, &st, 0) > 0))
     st = WIFEXITED(st) ? WEXITSTATUS(st) : S_ERR; /* return child status */
   else
@@ -295,6 +306,9 @@ static void add_args(struct StringArray *args, struct AddressList *al)
  * @param msg      File containing message
  * @param eightbit Message contains 8bit chars
  * @param sub      Config Subset
+ * @param async    Run sendmail in the background
+ * @param[out] pid_out      Process id of the delivery child, async only
+ * @param[out] childout_out Temp file with the delivery output, async only
  * @retval  0 Success
  * @retval -1 Failure
  *
@@ -303,7 +317,8 @@ static void add_args(struct StringArray *args, struct AddressList *al)
 int mutt_invoke_sendmail(struct Mailbox *m, struct AddressList *from,
                          struct AddressList *to, struct AddressList *cc,
                          struct AddressList *bcc, const char *msg,
-                         bool eightbit, struct ConfigSubset *sub)
+                         bool eightbit, struct ConfigSubset *sub,
+                         bool async, pid_t *pid_out, char **childout_out)
 {
   char *ps = NULL;
   char *path = NULL;
@@ -428,7 +443,8 @@ int mutt_invoke_sendmail(struct Mailbox *m, struct AddressList *from,
   ARRAY_ADD(&args, NULL);
 
   const short c_sendmail_wait = cs_subset_number(sub, "sendmail_wait");
-  i = send_msg(path, &args, msg, OptGui ? &childout : NULL, c_sendmail_wait);
+  i = send_msg(path, &args, msg, (OptGui || async) ? &childout : NULL,
+               async ? 0 : c_sendmail_wait, async, pid_out);
 
   /* Some user's $sendmail command uses gpg for password decryption,
    * and is set up to prompt using ncurses pinentry.  If we
@@ -437,6 +453,18 @@ int mutt_invoke_sendmail(struct Mailbox *m, struct AddressList *from,
   if (OptGui)
   {
     mutt_need_hard_redraw();
+  }
+
+  if (async && (i == 0))
+  {
+    // The delivery child owns the message now; hand over its output file
+    *childout_out = childout;
+    childout = NULL;
+    FREE(&path);
+    FREE(&s);
+    ARRAY_FREE(&args);
+    ARRAY_FREE(&extra_args);
+    return 0;
   }
 
   if (i != (EX_OK & 0xff))

@@ -58,6 +58,7 @@
 #include "mutt.h"
 #include "send.h"
 #include "attach/lib.h"
+#include "background.h"
 #include "browser/lib.h"
 #include "compose/lib.h"
 #include "editor/lib.h"
@@ -1428,14 +1429,55 @@ struct Address *mutt_default_from(struct ConfigSubset *sub)
 }
 
 /**
+ * mutt_encode_descriptions - RFC2047 encode the content-descriptions
+ * @param b       Body of email
+ * @param recurse If true, encode children parts
+ * @param sub     Config Subset
+ */
+void mutt_encode_descriptions(struct Body *b, bool recurse, struct ConfigSubset *sub)
+{
+  const struct Slist *const c_send_charset = cs_subset_slist(sub, "send_charset");
+  for (struct Body *t = b; t; t = t->next)
+  {
+    if (t->description)
+    {
+      rfc2047_encode(&t->description, NULL, sizeof("Content-Description:"), c_send_charset);
+    }
+    if (recurse && t->parts)
+      mutt_encode_descriptions(t->parts, recurse, sub);
+  }
+}
+
+/**
+ * decode_descriptions - RFC2047 decode them in case of an error
+ * @param b MIME parts to decode
+ */
+static void decode_descriptions(struct Body *b)
+{
+  for (struct Body *t = b; t; t = t->next)
+  {
+    if (t->description)
+    {
+      rfc2047_decode(&t->description);
+    }
+    if (t->parts)
+      decode_descriptions(t->parts);
+  }
+}
+
+/**
  * invoke_mta - Send an email
  * @param m   Mailbox
  * @param e   Email
  * @param sub Config Subset
+ * @param async    Run sendmail in the background
+ * @param[out] pid_out      Process id of the delivery child, async only
+ * @param[out] childout_out Temp file with the delivery output, async only
  * @retval  0 Success
  * @retval -1 Failure
  */
-static int invoke_mta(struct Mailbox *m, struct Email *e, struct ConfigSubset *sub)
+static int invoke_mta(struct Mailbox *m, struct Email *e, struct ConfigSubset *sub,
+                      bool async, pid_t *pid_out, char **childout_out)
 {
   struct Buffer *tempfile = NULL;
   int rc = -1;
@@ -1481,7 +1523,8 @@ static int invoke_mta(struct Mailbox *m, struct Email *e, struct ConfigSubset *s
 
 sendmail:
   rc = mutt_invoke_sendmail(m, &e->env->from, &e->env->to, &e->env->cc, &e->env->bcc,
-                            buf_string(tempfile), (e->body->encoding == ENC_8BIT), sub);
+                            buf_string(tempfile), (e->body->encoding == ENC_8BIT), sub,
+                            async, pid_out, childout_out);
 cleanup:
   if (fp_tmp)
   {
@@ -1493,41 +1536,44 @@ cleanup:
 }
 
 /**
- * mutt_encode_descriptions - RFC2047 encode the content-descriptions
- * @param b       Body of email
- * @param recurse If true, encode children parts
- * @param sub     Config Subset
+ * send_restore_clear - Undo the effects of mutt_protect() on an unsent message
+ * @param e             Email
+ * @param clear_content Cleartext body saved by mutt_protect()
+ *
+ * Restores the clear-text message so it can be edited again, e.g. after a
+ * failed delivery or when a background delivery is retained for a retry.
  */
-void mutt_encode_descriptions(struct Body *b, bool recurse, struct ConfigSubset *sub)
+static void send_restore_clear(struct Email *e, struct Body *clear_content)
 {
-  const struct Slist *const c_send_charset = cs_subset_slist(sub, "send_charset");
-  for (struct Body *t = b; t; t = t->next)
+  if (!WithCrypto)
+    ; // do nothing
+  else if ((e->security & (SEC_ENCRYPT | SEC_AUTOCRYPT)) ||
+           ((e->security & SEC_SIGN) && (e->body->type == TYPE_APPLICATION)))
   {
-    if (t->description)
+    if (e->body != clear_content)
     {
-      rfc2047_encode(&t->description, NULL, sizeof("Content-Description:"), c_send_charset);
+      mutt_body_free(&e->body); /* destroy PGP data */
+      e->body = clear_content;  /* restore clear text. */
     }
-    if (recurse && t->parts)
-      mutt_encode_descriptions(t->parts, recurse, sub);
   }
+  else if ((e->security & SEC_SIGN) && (e->body->type == TYPE_MULTIPART))
+  {
+    mutt_body_free(&e->body->parts->next); /* destroy sig */
+    if (mutt_istr_equal(e->body->subtype, "mixed") ||
+        mutt_istr_equal(e->body->subtype, "signed"))
+    {
+      e->body = mutt_remove_multipart(e->body);
+    }
+  }
+
+  mutt_env_free(&e->body->mime_headers); /* protected headers */
+  mutt_param_delete(&e->body->parameter, "protected-headers");
+  if (mutt_istr_equal(e->body->subtype, "mixed"))
+    e->body = mutt_remove_multipart(e->body);
+  decode_descriptions(e->body);
+  mutt_unprepare_envelope(e->env);
 }
 
-/**
- * decode_descriptions - RFC2047 decode them in case of an error
- * @param b MIME parts to decode
- */
-static void decode_descriptions(struct Body *b)
-{
-  for (struct Body *t = b; t; t = t->next)
-  {
-    if (t->description)
-    {
-      rfc2047_decode(&t->description);
-    }
-    if (t->parts)
-      decode_descriptions(t->parts);
-  }
-}
 
 /**
  * fix_end_of_file - Ensure a file ends with a linefeed
@@ -2046,6 +2092,7 @@ int mutt_send_message(SendFlags flags, struct Email *e_templ, const char *tempfi
   char *err = NULL;
   char *finalpath = NULL;
   struct Email *e_cur = NULL;
+  bool async_sent = false;
 
   if (ea && (ARRAY_SIZE(ea) == 1))
     e_cur = *ARRAY_GET(ea, 0);
@@ -2056,6 +2103,10 @@ int mutt_send_message(SendFlags flags, struct Email *e_templ, const char *tempfi
     OptNewsSend = true;
   else
     OptNewsSend = false;
+
+  const bool c_sendmail_async = cs_subset_bool(sub, "sendmail_async");
+  const bool async = c_sendmail_async && !(flags & SEND_BATCH) && !OptNewsSend &&
+                     !cs_subset_string(sub, "smtp_url");
 
   const enum QuadOption c_recall = cs_subset_quad(sub, "recall");
 
@@ -2784,39 +2835,24 @@ int mutt_send_message(SendFlags flags, struct Email *e_templ, const char *tempfi
     }
   }
 
-  i = invoke_mta(m, e_templ, sub);
+  if (async && bg_send_full())
+  {
+    mutt_error(_("Too many background commands"));
+    send_restore_clear(e_templ, clear_content);
+    FREE(&pgpkeylist);
+    FREE(&finalpath);
+    goto main_loop;
+  }
+
+  pid_t pid = -1;
+  char *childout = NULL;
+  i = invoke_mta(m, e_templ, sub, async, &pid, &childout);
   if (i < 0)
   {
     if (!(flags & SEND_BATCH))
     {
-      if (!WithCrypto)
-        ; // do nothing
-      else if ((e_templ->security & (SEC_ENCRYPT | SEC_AUTOCRYPT)) ||
-               ((e_templ->security & SEC_SIGN) && (e_templ->body->type == TYPE_APPLICATION)))
-      {
-        if (e_templ->body != clear_content)
-        {
-          mutt_body_free(&e_templ->body); /* destroy PGP data */
-          e_templ->body = clear_content;  /* restore clear text. */
-        }
-      }
-      else if ((e_templ->security & SEC_SIGN) && (e_templ->body->type == TYPE_MULTIPART))
-      {
-        mutt_body_free(&e_templ->body->parts->next); /* destroy sig */
-        if (mutt_istr_equal(e_templ->body->subtype, "mixed") ||
-            mutt_istr_equal(e_templ->body->subtype, "signed"))
-        {
-          e_templ->body = mutt_remove_multipart(e_templ->body);
-        }
-      }
-
+      send_restore_clear(e_templ, clear_content);
       FREE(&pgpkeylist);
-      mutt_env_free(&e_templ->body->mime_headers); /* protected headers */
-      mutt_param_delete(&e_templ->body->parameter, "protected-headers");
-      if (mutt_istr_equal(e_templ->body->subtype, "mixed"))
-        e_templ->body = mutt_remove_multipart(e_templ->body);
-      decode_descriptions(e_templ->body);
-      mutt_unprepare_envelope(e_templ->env);
       FREE(&finalpath);
       goto main_loop;
     }
@@ -2825,6 +2861,37 @@ int mutt_send_message(SendFlags flags, struct Email *e_templ, const char *tempfi
       puts(_("Could not send the message"));
       goto cleanup;
     }
+  }
+
+  if (async && (pid >= 0))
+  {
+    if (bg_send_register(pid, buf_string(fcc), childout, e_templ, flags,
+                         cs_subset_string(sub, "sendmail"), c_fcc_before_send) < 0)
+    {
+      // No slot left (checked above): deliver untracked, like a synchronous send
+      unlink(childout);
+      FREE(&childout);
+      if (!c_fcc_before_send)
+        save_fcc(m, e_templ, fcc, clear_content, pgpkeylist, flags, &finalpath, sub);
+      if (WithCrypto)
+        FREE(&pgpkeylist);
+      if ((WithCrypto != 0) && free_clear_content)
+        mutt_body_free(&clear_content);
+    }
+    else
+    {
+      async_sent = true;
+      send_restore_clear(e_templ, clear_content);
+      FREE(&pgpkeylist);
+    }
+    FREE(&finalpath);
+    if (OptGui)
+    {
+      mutt_message(_("Sending message in background"));
+      mutt_sleep(0);
+    }
+    rc = 0;
+    goto cleanup;
   }
 
   if (!c_fcc_before_send)
@@ -2884,7 +2951,7 @@ cleanup:
   }
 
   mutt_file_fclose(&fp_tmp);
-  if (!(flags & SEND_NO_FREE_HEADER))
+  if (!(flags & SEND_NO_FREE_HEADER) && !async_sent)
     email_free(&e_templ);
 
   FREE(&finalpath);

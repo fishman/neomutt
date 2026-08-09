@@ -37,8 +37,10 @@
 #include <unistd.h>
 #include "mutt/lib.h"
 #include "core/lib.h"
+#include "email/lib.h"
 #include "gui/lib.h"
 #include "background.h"
+#include "send/lib.h"
 #include "browser/lib.h"
 #include "editor/lib.h"
 #include "history/lib.h"
@@ -56,9 +58,14 @@ struct BackgroundJob
 {
   pid_t pid;           ///< Process id
   bool running;        ///< true if the process is still running
+  bool is_send;        ///< Job is a background message delivery
   int exit_code;       ///< Exit code, -1 if still running or killed by a signal
   struct Buffer *cmd;  ///< Command line
   struct Buffer *file; ///< Temp file with captured output
+  struct Email *email; ///< Message being delivered, retained for a retry
+  SendFlags send_flags;///< Flags to resend with
+  struct Buffer *fcc;  ///< Folder to copy the message to after delivery
+  bool fcc_done;       ///< Fcc copy was already written before sending
 };
 
 static struct BackgroundJob Jobs[MAX_JOBS] = { 0 };
@@ -84,7 +91,33 @@ static void job_slot_free(struct BackgroundJob *job)
   unlink(buf_string(job->file));
   buf_free(&job->cmd);
   buf_free(&job->file);
+  email_free(&job->email);
+  buf_free(&job->fcc);
   *job = (struct BackgroundJob) { 0 };
+}
+
+/**
+ * bg_job_alloc - Find a free job slot
+ * @retval ptr  A free slot
+ * @retval NULL None free
+ *
+ * Prefers an unused slot; recycles the first finished one otherwise.
+ * Slots holding a message that failed to send are not recycled.
+ */
+static struct BackgroundJob *bg_job_alloc(void)
+{
+  struct BackgroundJob *job = NULL;
+  for (int i = 0; i < MAX_JOBS; i++)
+  {
+    if (!Jobs[i].cmd) // never used slot
+    {
+      job = &Jobs[i];
+      break;
+    }
+    if (!job && !Jobs[i].running && !Jobs[i].email) // finished slot
+      job = &Jobs[i];
+  }
+  return job;
 }
 
 /**
@@ -120,7 +153,8 @@ static int bg_make_entry(struct Menu *menu, int line, int max_cols, struct Buffe
   const int slot = ((const int *) menu->mdata)[line];
   const struct BackgroundJob *job = &Jobs[slot];
 
-  const char *status = job->running ? _("run") : _("done");
+  const char *status = job->running ? _("run") :
+                       (job->is_send && (job->exit_code != 0)) ? _("fail") : _("done");
   char exitbuf[16] = { 0 };
   if (!job->running)
   {
@@ -227,7 +261,12 @@ void dlg_output(void)
   simple_dialog_free(&sdw.dlg);
 
   if (slot >= 0)
-    bg_view_output(&Jobs[slot]);
+  {
+    if (Jobs[slot].email) // failed delivery, resend the message
+      bg_send_retry(slot);
+    else
+      bg_view_output(&Jobs[slot]);
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -251,8 +290,38 @@ int bg_reap(void)
 
     job->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     job->running = false;
-    mutt_message(_("Background command \"%s\" finished (exit %d)"),
-                 buf_string(job->cmd), job->exit_code);
+    if (job->is_send)
+    {
+      if (job->exit_code == 0)
+      {
+        // The message was delivered; write the Fcc copy now
+        if (!job->fcc_done && !buf_is_empty(job->fcc) &&
+            !mutt_str_equal("/dev/null", buf_string(job->fcc)))
+        {
+          job->email->received = mutt_date_now();
+          char *finalpath = NULL;
+          if (mutt_write_multiple_fcc(buf_string(job->fcc), job->email, NULL, false,
+                                      NULL, &finalpath, NeoMutt->sub) != 0)
+          {
+            mutt_error(_("Warning: Fcc to %s failed"), buf_string(job->fcc));
+          }
+          FREE(&finalpath);
+        }
+        email_free(&job->email);
+        buf_free(&job->fcc);
+        mutt_message(_("Mail sent"));
+      }
+      else
+      {
+        // Keep the message so the user can resend it
+        mutt_message(_("Send failed (exit %d)"), job->exit_code);
+      }
+    }
+    else
+    {
+      mutt_message(_("Background command \"%s\" finished (exit %d)"),
+                   buf_string(job->cmd), job->exit_code);
+    }
     reaped++;
   }
 
@@ -348,18 +417,7 @@ void bg_wait(void)
  */
 int bg_job_start(const char *cmd)
 {
-  // Prefer an unused slot; recycle the first finished one otherwise
-  struct BackgroundJob *job = NULL;
-  for (int i = 0; i < MAX_JOBS; i++)
-  {
-    if (!Jobs[i].cmd) // never used slot
-    {
-      job = &Jobs[i];
-      break;
-    }
-    if (!job && !Jobs[i].running) // finished slot
-      job = &Jobs[i];
-  }
+  struct BackgroundJob *job = bg_job_alloc();
   if (!job)
   {
     mutt_error(_("Too many background commands"));
@@ -429,6 +487,74 @@ int bg_job_exit_code(int slot)
   if ((slot < 0) || (slot >= MAX_JOBS))
     return -1;
   return Jobs[slot].exit_code;
+}
+
+/**
+ * bg_send_full - Is the job table full?
+ * @retval true No slot is available for a new job
+ */
+bool bg_send_full(void)
+{
+  return bg_job_alloc() == NULL;
+}
+
+/**
+ * bg_send_register - Track a message being delivered in the background
+ * @param pid      Delivery child's process id
+ * @param fcc      Folder to copy the message to after delivery
+ * @param childout Temp file with the delivery output
+ * @param e        Message being delivered
+ * @param flags    Flags to resend with
+ * @param cmd      Delivery command, shown in the job list
+ * @param fcc_done Fcc copy was already written before sending
+ * @retval num Slot number of the new job
+ * @retval -1  Error, no slot free
+ */
+int bg_send_register(pid_t pid, const char *fcc, const char *childout,
+                     struct Email *e, SendFlags flags, const char *cmd, bool fcc_done)
+{
+  struct BackgroundJob *job = bg_job_alloc();
+  if (!job)
+    return -1;
+  if (job->cmd) // recycling a finished job
+    job_slot_free(job);
+
+  job->pid = pid;
+  job->running = true;
+  job->is_send = true;
+  job->exit_code = -1;
+  job->email = e;
+  job->send_flags = flags;
+  job->fcc = buf_new(fcc);
+  job->fcc_done = fcc_done;
+  job->cmd = buf_new(NONULL(cmd));
+  job->file = buf_new(childout);
+
+  return job - Jobs;
+}
+
+/**
+ * bg_send_retry - Resend a message whose delivery failed
+ * @param slot Slot number
+ *
+ * Re-opens the compose dialog with the retained message.  The job is
+ * released; the new send registers a fresh job.
+ */
+void bg_send_retry(int slot)
+{
+  if ((slot < 0) || (slot >= MAX_JOBS))
+    return;
+  struct BackgroundJob *job = &Jobs[slot];
+  if (!job->is_send || job->running || !job->email)
+    return;
+
+  // Take ownership of the message, then release the job slot
+  struct Email *e = job->email;
+  const SendFlags flags = job->send_flags;
+  job->email = NULL;
+  job_slot_free(job);
+
+  mutt_send_message(flags, e, NULL, NULL, NULL, NeoMutt->sub);
 }
 
 /**

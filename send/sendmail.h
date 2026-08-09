@@ -24,6 +24,7 @@
 #define MUTT_SEND_SENDMAIL_H
 
 #include <stdbool.h>
+#include <sys/types.h>
 
 struct AddressList;
 struct ConfigSubset;
@@ -32,6 +33,7 @@ struct Mailbox;
 int mutt_invoke_sendmail(struct Mailbox *m, struct AddressList *from,
                          struct AddressList *to, struct AddressList *cc,
                          struct AddressList *bcc, const char *msg,
-                         bool eightbit, struct ConfigSubset *sub);
+                         bool eightbit, struct ConfigSubset *sub,
+                         bool async, pid_t *pid_out, char **childout_out);
 
 #endif /* MUTT_SEND_SENDMAIL_H */

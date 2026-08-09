@@ -867,7 +867,7 @@ static int bounce_message(FILE *fp, struct Mailbox *m, struct Email *e,
     else
     {
       rc = mutt_invoke_sendmail(m, env_from, to, NULL, NULL, buf_string(tempfile),
-                                (e->body->encoding == ENC_8BIT), sub);
+                                (e->body->encoding == ENC_8BIT), sub, false, NULL, NULL);
     }
   }
 

@@ -353,6 +353,9 @@ struct ConfigDef SendVars[] = {
   { "sendmail", DT_STRING|D_STRING_COMMAND, IP SENDMAIL " -oem -oi", 0, simple_command_validator,
     "External command to send email"
   },
+  { "sendmail_async", DT_BOOL, false, 0, NULL,
+    "Send email in the background"
+  },
   { "sendmail_wait", DT_NUMBER, 0, 0, NULL,
     "Time to wait for sendmail to finish"
   },
